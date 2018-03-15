@@ -16,6 +16,8 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.*;
 import io.netty.handler.codec.http.websocketx.*;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.GenericFutureListener;
 import io.netty.util.concurrent.ScheduledFuture;
 
 import java.io.UnsupportedEncodingException;
@@ -101,16 +103,26 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
                     }
                 }
                 if (group != null && !group.isShuttingDown()) {
-                    group.shutdownGracefully(5, 10, TimeUnit.SECONDS).syncUninterruptibly();
+                    group.shutdownGracefully(5, 10, TimeUnit.SECONDS).addListener(new GenericFutureListener() {
+                        @Override
+                        public void operationComplete(Future future) throws Exception {
+                            shutDownGroup.shutdownGracefully(5, 10, TimeUnit.SECONDS);
+                            shutDownGroup = null;
+                        }
+                    }).syncUninterruptibly();
                     group = null;
                 }
             }
         }, 250L, TimeUnit.MILLISECONDS);
     }
 
-    private String buildURL(String path, List<HttpParam> parametersQuery) throws UnsupportedEncodingException {
+    private String buildURL(String path, List<HttpParam> parametersQuery, boolean withAddress) throws UnsupportedEncodingException {
         StringBuilder uriBuilder = new StringBuilder();
-        uriBuilder.append(baseUri.getPath());
+        if (withAddress) {
+            uriBuilder.append(baseUri);
+        } else {
+            uriBuilder.append(baseUri.getPath());
+        }
         uriBuilder.append("ari");
         uriBuilder.append(path);
         uriBuilder.append("?api_key=");
@@ -132,9 +144,13 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
 
     // Factory for WS handshakes
     private WebSocketClientHandshaker getWsHandshake(String path, List<HttpParam> parametersQuery) throws UnsupportedEncodingException {
-        String url = buildURL(path, parametersQuery);
+        String url = buildURL(path, parametersQuery, true);
         try {
-            URI uri = new URI(url.replaceFirst("http", "ws"));
+            if (url.regionMatches(true, 0, "http", 0, 4)) {
+                // http(s):// -> ws(s)://
+                url = "ws" + url.substring(4);
+            }
+            URI uri = new URI(url);
             return WebSocketClientHandshakerFactory.newHandshaker(
                     uri, WebSocketVersion.V13, null, false, null);
         } catch (URISyntaxException e) {
@@ -145,7 +161,7 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
 
     // Build the HTTP request based on the given parameters
     private HttpRequest buildRequest(String path, String method, List<HttpParam> parametersQuery, List<HttpParam> parametersForm, List<HttpParam> parametersBody) throws UnsupportedEncodingException {
-        String url = buildURL(path, parametersQuery);
+        String url = buildURL(path, parametersQuery, false);
         FullHttpRequest request = new DefaultFullHttpRequest(
                 HttpVersion.HTTP_1_1, HttpMethod.valueOf(method), url);
         //System.out.println(request.getUri());
@@ -294,15 +310,20 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
             @Override
             public void operationComplete(ChannelFuture future) throws Exception {
                 if (future.isSuccess()) {
-                    callback.onChReadyToWrite();
-                    // reset the reconnect counter on successful connect
-                    reconnectCount = 0;
+                    wsHandler.handshakeFuture().addListener(new ChannelFutureListener() {
+                        @Override
+                        public void operationComplete(ChannelFuture future) throws Exception {
+                            if (future.isSuccess()) {
+                                callback.onChReadyToWrite();
+                                // reset the reconnect counter on successful connect
+                                reconnectCount = 0;
+                            } else {
+                                reconnectWs(future.cause());
+                            }
+                        }
+                    });
                 } else {
-                    if (reconnectCount >= 10) {
-                        callback.onFailure(future.cause());
-                    } else {
-                        reconnectWs();
-                    }
+                    reconnectWs(future.cause());
                 }
             }
         };
@@ -375,16 +396,23 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
 
 
     @Override
-    public void reconnectWs() {
+    public void reconnectWs(Throwable cause) {
         // cancel the ping timer
         if (wsPingTimer != null) {
             wsPingTimer.cancel(false);
             wsPingTimer = null;
         }
+
+        if (reconnectCount >= 10) {
+            wsCallback.onFailure(cause);
+            return;
+        }
+
         // if not shutdown reconnect, note the check not on the shutDownGroup
         if (!group.isShuttingDown()) {
             // schedule reconnect after a 2,5,10 seconds
             long[] timeouts = {2L, 5L, 10L};
+            long timeout = reconnectCount >= timeouts.length ? timeouts[timeouts.length - 1] : timeouts[reconnectCount];
             reconnectCount++;
             shutDownGroup.schedule(new Runnable() {
                 @Override
@@ -399,7 +427,7 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
                         wsCallback.onFailure(e);
                     }
                 }
-            }, reconnectCount >= timeouts.length ? timeouts[timeouts.length - 1] : timeouts[reconnectCount], TimeUnit.SECONDS);
+            }, timeout, TimeUnit.SECONDS);
         }
     }
 }
